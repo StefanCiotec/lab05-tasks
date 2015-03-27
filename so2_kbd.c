@@ -19,7 +19,7 @@ MODULE_DESCRIPTION("SO2 KBD");
 MODULE_AUTHOR("SO2");
 MODULE_LICENSE("GPL");
 
-#define LOG_LEVEL		KERN_ALERT
+#define LOG_LEVEL		KERN_INFO
 #define MODULE_NAME		"so2_kbd"
 
 #define SO2_KBD_MAJOR		42
@@ -36,15 +36,19 @@ MODULE_LICENSE("GPL");
 #define MAGIC_WORD		"root"
 #define MAGIC_WORD_LEN		4
 
+char *word;
+
 struct so2_device_data {
 	struct cdev cdev;
 	/* TODO 4: locking mechanism */
 	spinlock_t lock;
 	char buf[BUFFER_SIZE];
-	atomic_t size;
+	int size;
 	/* use passcnt to hold the no. of chars that were matched so far */
 	int passcnt;
 } devs[1];
+
+unsigned long flags;
 
 
 /**
@@ -111,16 +115,22 @@ irqreturn_t so2_kbd_interrupt_handle(int irq_no, void *dev_id)
 
 	if (is_key_press(val) != 0) {
 		c = get_ascii(val);
-		printk("%c\n", c);
-		if (atomic_read(&data->size) < BUFFER_SIZE) {
-			spin_lock_irq(&data->lock);
-			data->buf[atomic_read(&data->size)] = c;
-			spin_unlock_irq(&data->lock);
-			atomic_inc(&data->size);
+		//printk(LOG_LEVEL "%c\n", c);
+		if (data->size < BUFFER_SIZE) {
+			data->buf[data->size] = c;
+			data->size++;
+		}
+		if (c == word[data->passcnt]) {
+			data->passcnt++;
+			if (data->passcnt == MAGIC_WORD_LEN) {
+				printk(LOG_LEVEL "Match\n");
+				memset(data->buf, 0, BUFFER_SIZE);
+				data->size = 0;
+			}
 		}
 	}
 
-	return IRQ_HANDLED;
+	return IRQ_NONE;
 }
 
 
@@ -148,26 +158,35 @@ so2_kbd_read(struct file *file, char __user *user_buffer,
 		(struct so2_device_data *) file->private_data;
 	char *tmp;
 
+	spin_lock_irqsave(&data->lock, flags);
 	/* check if range is valid */
-	if (*offset > atomic_read(&data->size))
+	if (*offset > data->size) {
+		spin_unlock_irqrestore(&data->lock, flags);
 		return 0;
+	}
 
-	if (size > atomic_read(&data->size) - *offset)
-		size = atomic_read(&data->size) - *offset;
+	if (size > (data->size - *offset))
+		size = data->size - *offset;
 
 	/* TODO 4: allocate the temp buffer */
-	tmp = kmalloc(size, GFP_KERNEL);
-	if (!tmp)
+	tmp = kmalloc(size * sizeof(char),  GFP_ATOMIC);
+	if (!tmp) {
+		spin_unlock_irqrestore(&data->lock, flags);
 		return 0;
+	}
 
 	/* TODO 4: read from the device's internal buffer to temporary
 	 * buffer , use synchronization */
-	spin_lock_irq(&data->lock);
-	memcpy(tmp, data->buf, size);
-	spin_unlock_irq(&data->lock);
+	memcpy(tmp, &data->buf[*offset], size);
+	spin_unlock_irqrestore(&data->lock, flags);
+
 	/* TODO 4: read from the temp buffer to user buffer */
-	if (copy_to_user(user_buffer, tmp, size))
+	if (copy_to_user(user_buffer, tmp, size)) {
+		kfree(tmp);
 		return 0;
+	}
+
+	kfree(tmp);
 
 	/* update offset */
 	*offset += size;
@@ -218,9 +237,13 @@ static int so2_kbd_init(void)
 	if (err != 0)
 		goto out2;
 
-	atomic_set(&devs[0].size, 0);
+	devs[0].size = 0;
+	devs[0].passcnt = 0;
 	cdev_init(&devs[0].cdev, &so2_kbd_fops);
 	cdev_add(&devs[0].cdev, MKDEV(SO2_KBD_MAJOR, SO2_KBD_MINOR), 1);
+
+	word = kmalloc(MAGIC_WORD_LEN, GFP_KERNEL);
+	word = MAGIC_WORD;
 
 	printk(LOG_LEVEL "Driver %s loaded\n", MODULE_NAME);
 	return 0;
@@ -243,7 +266,7 @@ static void so2_kbd_exit(void)
 	release_region(I8042_STATUS_REG, 1);
 	release_region(I8042_DATA_REG, 1);
 	*/
-
+	kfree(word);
 	unregister_chrdev_region(MKDEV(SO2_KBD_MAJOR, SO2_KBD_MINOR),
 			SO2_KBD_NR_MINORS);
 	printk(LOG_LEVEL "Driver %s unloaded\n", MODULE_NAME);
